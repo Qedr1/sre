@@ -299,30 +299,26 @@ read_host_settings() {
     current_hostname=$(hostname)
     printf 'Hostname [%s]: ' "$current_hostname"
     IFS= read -r host_name || fail 'Could not read the hostname.'
-    host_name=${host_name:-$current_hostname}
+    if [[ -z $host_name ]]; then return; fi
     [[ ${#host_name} -le 64 && $host_name != .* && $host_name != *. ]] ||
         fail 'Enter a valid hostname of at most 64 characters.'
     IFS=. read -r -a labels <<< "$host_name"
     for label in "${labels[@]}"; do
-        [[ $label =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] ||
-            fail 'Enter a hostname made of lowercase DNS labels.'
+        [[ $label =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] ||
+            fail 'Enter a hostname made of valid DNS labels.'
     done
-
-    printf 'Root SSH public key: '
-    IFS= read -r public_key || fail 'Could not read the public key.'
-    local key_type key_data
-    read -r key_type key_data _ <<< "$public_key"
-    [[ $key_type =~ ^(ssh-|ecdsa-|sk-)[a-zA-Z0-9@._+-]+$ &&
-        $key_type != *-cert-* && $key_data =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
-        fail 'Paste one OpenSSH public key line.'
 }
 
 install_root_key() {
+    local public_key=$1 key_type key_data fingerprint
     local directory=/root/.ssh file=/root/.ssh/authorized_keys
-    local fingerprint fingerprints='' candidate="$scratch/root-authorized-keys"
+    local installed_fingerprints='' candidate="$scratch/root-authorized-keys"
 
-    install_packages openssh-client
-    fingerprint=$(ssh-keygen -lf /dev/stdin <<< "$public_key") ||
+    read -r key_type key_data _ <<< "$public_key"
+    [[ $key_type =~ ^(ssh-|ecdsa-|sk-)[a-zA-Z0-9@._+-]+$ &&
+        $key_type != *-cert-* && $key_data =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
+        fail 'Paste one valid OpenSSH public key line.'
+    fingerprint=$(ssh-keygen -E sha256 -lf /dev/stdin <<< "$public_key") ||
         fail 'The public key could not be decoded.'
     read -r _ fingerprint _ <<< "$fingerprint"
     [[ ! -L $directory && ! -L $file && ( ! -e $file || -f $file ) ]] ||
@@ -331,17 +327,36 @@ install_root_key() {
     install -d -o root -g root -m 0700 -- "$directory"
     if [[ -f $file ]]; then
         cp -- "$file" "$candidate"
-        fingerprints=$(ssh-keygen -lf "$file" 2>/dev/null) || :
+        installed_fingerprints=$(ssh-keygen -E sha256 -lf "$file" 2>/dev/null) || :
     else
         : > "$candidate"
     fi
-    if ! awk -v wanted="$fingerprint" '$2 == wanted { found = 1 } END { exit !found }' <<< "$fingerprints"; then
+    if ! awk -v wanted="$fingerprint" '$2 == wanted { found = 1 } END { exit !found }' <<< "$installed_fingerprints"; then
         if [[ -s $candidate && -n $(tail -c 1 -- "$candidate") ]]; then
             printf '\n' >> "$candidate"
         fi
         printf '%s\n' "$public_key" >> "$candidate"
     fi
     write_config "$file" 600 < "$candidate"
+}
+
+configure_root_keys() {
+    local public_keys public_key
+    install_packages openssh-client
+    public_keys=$(timeout 10s ssh-add -L 2>/dev/null) || public_keys=
+    if [[ -z $public_keys ]]; then
+        printf 'Root SSH public key: '
+        IFS= read -r public_keys || fail 'Could not read the public key.'
+    fi
+    while IFS= read -r public_key; do
+        install_root_key "$public_key"
+    done <<< "$public_keys"
+
+    printf 'Additional root SSH public key [Enter to skip]: '
+    IFS= read -r public_key || fail 'Could not read the additional public key.'
+    if [[ -n $public_key ]]; then
+        install_root_key "$public_key"
+    fi
 }
 
 configure_time_sync() {
@@ -851,7 +866,8 @@ BASHRC
 
 configure_base_software() {
     install_packages auditd openssh-server openssh-client libpam-modules \
-        tmux bind9-dnsutils net-tools iperf3 ethtool bash-completion sqlite3
+        tmux bind9-dnsutils net-tools iperf3 ethtool bash-completion sqlite3 \
+        curl mtr-tiny mc htop bwm-ng iptraf-ng zstd
     configure_tmux
     configure_bash
 }
@@ -919,7 +935,7 @@ SYSCTL
 initialize_host() (
     export PATH=/usr/sbin:/usr/bin:/sbin:/bin
     export LC_ALL=C
-    local debian_codename lock_fd host_name public_key
+    local debian_codename lock_fd host_name
     preflight
     exec {lock_fd}</etc/sysctl.d
     flock -n "$lock_fd" || fail 'Another host initialization is running.'
@@ -931,8 +947,10 @@ initialize_host() (
     configure_apt_sources "$debian_codename"
     upgrade_system
     read_host_settings
-    install_root_key
-    hostnamectl --static --transient hostname "$host_name"
+    configure_root_keys
+    if [[ -n $host_name ]]; then
+        hostnamectl --static --transient hostname "$host_name"
+    fi
     configure_time_sync
     configure_base_software
     configure_network
