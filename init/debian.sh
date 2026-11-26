@@ -489,11 +489,49 @@ JOURNAL
 }
 
 configure_login_banner() {
+    local pam_file=/etc/pam.d/sshd
+    local login_rule='session    optional     pam_exec.so stdout type=open_session /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /etc/update-motd.d/10-sysinfo --last-login'
+    local motd=/etc/motd template=/usr/share/base-files/motd
+
     mkdir -p /etc/update-motd.d
     write_config /etc/update-motd.d/10-sysinfo 755 <<'MOTD'
 #!/bin/bash
 
 export LC_ALL=C
+
+if [[ ${1-} == --last-login ]]; then
+    login=—
+    peer=—
+    login_time=—
+    separator=$'\037'
+
+    # OpenSSH records the new terminal login only after the PAM session opens.
+    if [[ -r /var/log/wtmp.db ]] &&
+        record=$(timeout 2s sqlite3 -readonly -batch -init /dev/null -noheader \
+            -cmd '.timeout 1500' -list -separator "$separator" /var/log/wtmp.db "
+                SELECT User, COALESCE(RemoteHost, ''),
+                       strftime('%Y-%m-%d %H:%M:%S UTC', Login / 1000000, 'unixepoch')
+                FROM wtmp
+                WHERE Type = 3 AND TTY GLOB 'pts/[0-9]*'
+                  AND (Service = 'sshd' OR (Service IS NULL AND RemoteHost <> ''))
+                ORDER BY Login DESC, ID DESC
+                LIMIT 1;
+            " 2>/dev/null) && [[ -n $record ]]; then
+        IFS=$separator read -r login peer login_time <<< "$record"
+        if [[ ! $login_time || $login =~ [[:cntrl:]] ]]; then
+            login=—
+            peer=—
+            login_time=—
+        elif [[ ! $peer =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ &&
+                ! $peer =~ ^[[:xdigit:].]*:[[:xdigit:].:]+(%[[:alnum:]_.-]+)?$ ]]; then
+            peer=—
+        fi
+    fi
+
+    printf '\n  Last login......: %s\n  Last login IP...: %s\n  Last login Time.: %s\n' \
+        "$login" "$peer" "$login_time"
+    exit
+fi
 
 # get load averages
 IFS=" " read LOAD1 LOAD5 LOAD15 <<<$(cat /proc/loadavg | awk '{ print $1,$2,$3 }')
@@ -542,6 +580,35 @@ if [[ -r $resolv_conf ]]; then
     }' "$resolv_conf"
 fi
 MOTD
+
+    if [[ -f $motd ]]; then
+        perl -0777 -pe '
+            BEGIN {
+                my $template = shift @ARGV;
+                open my $file, "<", $template or die "$template: $!\n";
+                $default = <$file>;
+                $default =~ s/\A\n+|\n+\z//g;
+                length $default or die "$template is empty\n";
+            }
+            if (s/^\Q$default\E(?:\n|\z)//mg && !/\S/) { $_ = ""; }
+        ' "$template" "$motd" > "$scratch/motd"
+        if ! cmp -s -- "$motd" "$scratch/motd"; then
+            write_config "$motd" "$(stat -Lc '%a' -- "$motd")" < "$scratch/motd"
+        fi
+    fi
+
+    # Send the last-login block through this connection's PAM conversation.
+    awk -v rule="$login_rule" '
+        $0 == rule { next }
+        !added && (/^# SELinux needs to intervene at login time/ ||
+            (/^session[[:blank:]]/ && /[[:blank:]]pam_selinux[.]so[[:blank:]]+open([[:blank:]]|$)/)) {
+            print rule
+            added = 1
+        }
+        { print }
+        END { if (!added) print rule }
+    ' "$pam_file" > "$scratch/pam-sshd"
+    write_config "$pam_file" 644 < "$scratch/pam-sshd"
 }
 
 configure_ssh_client() {
@@ -566,6 +633,8 @@ verify_ssh_server_config() {
     effective=$(sshd -T) || return 1
     [[ $(awk '$1 == "port" { print $2 }' <<< "$effective") == "$ssh_port" ]] &&
         grep -qx 'usepam yes' <<< "$effective" &&
+        grep -qx 'printmotd no' <<< "$effective" &&
+        grep -qx 'printlastlog no' <<< "$effective" &&
         grep -qx 'allowagentforwarding yes' <<< "$effective" &&
         grep -qx 'disableforwarding no' <<< "$effective" &&
         grep -qx 'compression yes' <<< "$effective" &&
@@ -593,6 +662,8 @@ configure_ssh_server() {
     write_config "$file" 644 <<SSH_SERVER
 Port $ssh_port
 UsePAM yes
+PrintMotd no
+PrintLastLog no
 AllowAgentForwarding yes
 Compression yes
 ClientAliveInterval 30
@@ -780,7 +851,7 @@ BASHRC
 
 configure_base_software() {
     install_packages auditd openssh-server openssh-client libpam-modules \
-        tmux bind9-dnsutils net-tools iperf3 ethtool bash-completion
+        tmux bind9-dnsutils net-tools iperf3 ethtool bash-completion sqlite3
     configure_tmux
     configure_bash
 }
