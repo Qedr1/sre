@@ -504,12 +504,15 @@ JOURNAL
 }
 
 configure_login_banner() {
+    local motd_dir=/etc/update-motd.d
     local pam_file=/etc/pam.d/sshd
     local login_rule='session    optional     pam_exec.so stdout type=open_session /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /etc/update-motd.d/10-sysinfo --last-login'
     local motd=/etc/motd template=/usr/share/base-files/motd
 
-    mkdir -p /etc/update-motd.d
-    write_config /etc/update-motd.d/10-sysinfo 755 <<'MOTD'
+    [[ ! -L $motd_dir ]] || fail "Unexpected symlink at $motd_dir."
+    mkdir -p -- "$motd_dir"
+    find "$motd_dir" -xdev -mindepth 1 -delete
+    write_config "$motd_dir/10-sysinfo" 755 <<'MOTD'
 #!/bin/bash
 
 export LC_ALL=C
@@ -543,7 +546,7 @@ if [[ ${1-} == --last-login ]]; then
         fi
     fi
 
-    printf '\n  Last login......: %s\n  Last login IP...: %s\n  Last login Time.: %s\n' \
+    printf '\n  Last........: %s\n  Last IP.....: %s\n  Last Time...: %s\n' \
         "$login" "$peer" "$login_time"
     exit
 fi
