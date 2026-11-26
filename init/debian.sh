@@ -546,7 +546,7 @@ if [[ ${1-} == --last-login ]]; then
         fi
     fi
 
-    printf '\n  Last........: %s\n  Last IP.....: %s\n  Last Time...: %s\n' \
+    printf '\n  Last........: %s\n  Last IP.....: %s\n  Last Time...: %s\n\n' \
         "$login" "$peer" "$login_time"
     exit
 fi
@@ -568,7 +568,6 @@ W="\e[0;39m"
 G="\e[0;34m"
 
 echo -e "
-${W}system info:
 $W  Distro......: $W`cat /etc/*release | grep "PRETTY_NAME" | cut -d "=" -f 2- | sed 's/"//g'`
 $W  Kernel......: $W`uname -sr`
 
@@ -907,7 +906,6 @@ configure_network() {
     fi
 
     cat > "$scratch/10-network.conf" <<'SYSCTL'
-vm.swappiness = 100
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
