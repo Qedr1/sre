@@ -1,6 +1,6 @@
 # Инициализатор Debian
 
-Инициализационный скрипт нового хоста обновляет пакеты, задаёт параметры ядра, настраивает аудит и SSH и подготавливает интерактивную среду. [Исходный код](init/debian.sh)
+Инициализационный скрипт нового хоста обновляет пакеты, задаёт параметры ядра, настраивает аудит и SSH и подготавливает интерактивную среду. [Исходный код](debian.sh)
 
 
 ## Архитектура
@@ -130,9 +130,9 @@ net.ipv4.ip_forward = 1
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv4.conf.all.rp_filter = 2
-net.core.wmem_max = 33554432
 net.ipv4.tcp_rmem = 4096 131072 33554432
 net.ipv4.tcp_wmem = 4096 16384 33554432
+net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_congestion_control = bbr
 net.core.default_qdisc = fq
 ~~~
