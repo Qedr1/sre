@@ -1,7 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-ssh_port=22221
+default_ssh_port=2221
+ssh_port=
+non_interactive=0
 scratch=
 pending_file=
 
@@ -32,18 +34,39 @@ write_config() {
     pending_file=
 }
 
+validate_ssh_port() {
+    local port=$1
+    if [[ ! $port =~ ^[1-9][0-9]{0,4}$ ]] || (( port > 65535 )); then
+        fail "Invalid SSH port: $port"
+    fi
+}
+
 parse_args() {
+    local usage="Usage: ${0##*/} [--ssh-port PORT] [--non-interactive]"
     if [[ $# -eq 1 && $1 == --help ]]; then
-        printf 'Usage: %s [--ssh-port PORT]\n' "${0##*/}"
+        printf '%s\n' "$usage"
         exit 0
     fi
-    if [[ $# -eq 2 && $1 == --ssh-port ]]; then
-        ssh_port=$2
-    elif [[ $# -ne 0 ]]; then
-        fail 'Usage: init-host_T3.sh [--ssh-port PORT]'
-    fi
-    if [[ ! $ssh_port =~ ^[1-9][0-9]{0,4}$ ]] || (( ssh_port > 65535 )); then
-        fail "Invalid SSH port: $ssh_port"
+
+    while (( $# )); do
+        case $1 in
+            --ssh-port)
+                [[ $# -ge 2 && -z $ssh_port ]] || fail "$usage"
+                validate_ssh_port "$2"
+                ssh_port=$2
+                shift 2
+                ;;
+            --non-interactive)
+                non_interactive=1
+                shift
+                ;;
+            *)
+                fail "$usage"
+                ;;
+        esac
+    done
+    if (( non_interactive )); then
+        ssh_port=${ssh_port:-$default_ssh_port}
     fi
 }
 
@@ -296,6 +319,12 @@ install_packages() {
 read_host_settings() {
     local current_hostname label
     local -a labels
+    if [[ -z $ssh_port ]]; then
+        printf 'SSH port [%s]: ' "$default_ssh_port"
+        IFS= read -r ssh_port || fail 'Could not read the SSH port.'
+        ssh_port=${ssh_port:-$default_ssh_port}
+        validate_ssh_port "$ssh_port"
+    fi
     current_hostname=$(hostname)
     printf 'Hostname [%s]: ' "$current_hostname"
     IFS= read -r host_name || fail 'Could not read the hostname.'
@@ -345,6 +374,7 @@ configure_root_keys() {
     install_packages openssh-client
     public_keys=$(timeout 10s ssh-add -L 2>/dev/null) || public_keys=
     if [[ -z $public_keys ]]; then
+        if (( non_interactive )); then return; fi
         printf 'Root SSH public key: '
         IFS= read -r public_keys || fail 'Could not read the public key.'
     fi
@@ -352,6 +382,7 @@ configure_root_keys() {
         install_root_key "$public_key"
     done <<< "$public_keys"
 
+    if (( non_interactive )); then return; fi
     printf 'Additional root SSH public key [Enter to skip]: '
     IFS= read -r public_key || fail 'Could not read the additional public key.'
     if [[ -n $public_key ]]; then
@@ -936,7 +967,7 @@ SYSCTL
 initialize_host() (
     export PATH=/usr/sbin:/usr/bin:/sbin:/bin
     export LC_ALL=C
-    local debian_codename lock_fd host_name
+    local debian_codename lock_fd host_name=
     preflight
     exec {lock_fd}</etc/sysctl.d
     flock -n "$lock_fd" || fail 'Another host initialization is running.'
@@ -947,7 +978,9 @@ initialize_host() (
 
     configure_apt_sources "$debian_codename"
     upgrade_system
-    read_host_settings
+    if (( ! non_interactive )); then
+        read_host_settings
+    fi
     configure_root_keys
     if [[ -n $host_name ]]; then
         hostnamectl --static --transient hostname "$host_name"
@@ -963,8 +996,12 @@ initialize_host() (
 
 main() {
     parse_args "$@"
+    if (( non_interactive )); then
+        initialize_host </dev/null
+        return
+    fi
     if ! ( : </dev/tty ) 2>/dev/null; then
-        fail 'Run in a terminal to enter the hostname and SSH public key.'
+        fail 'Run in a terminal or use --non-interactive.'
     fi
     initialize_host </dev/tty >/dev/tty 2>&1
     exec /bin/bash -i </dev/tty >/dev/tty 2>&1
