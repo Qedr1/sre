@@ -898,7 +898,7 @@ BASHRC
 }
 
 configure_base_software() {
-    install_packages auditd openssh-server openssh-client libpam-modules \
+    install_packages auditd openssh-server openssh-client libpam-modules nftables \
         tmux bind9-dnsutils net-tools iperf3 ethtool bash-completion sqlite3 \
         curl mtr-tiny mc htop bwm-ng iptraf-ng zstd
     configure_tmux
@@ -964,6 +964,107 @@ SYSCTL
     fi
 }
 
+configure_firewall() {
+    local rules=/etc/init-security-rules.nft
+    local unit=init-security-rules.service
+
+    cat > "$scratch/init-security-rules.nft" <<'NFT'
+add table ip init_security_rules
+delete table ip init_security_rules
+table ip init_security_rules {
+    # Адаптация транзитных TCP-соединений к MTU маршрута.
+    chain forward_mss {
+        type filter hook forward priority mangle;
+
+        # Защита от зависания передачи из-за потери слишком крупных пакетов на транзите.
+        tcp flags syn / syn,rst tcp option maxseg size set rt mtu
+    }
+
+    # Лимит SYN для каждого IP защищает очередь полуоткрытых соединений.
+    set syn_rate  { type ipv4_addr; flags dynamic,timeout; timeout 10s; size 65536; }
+
+    # Лимит ping для каждого IP защищает хост от перегрузки ICMP-запросами.
+    set echo_rate { type ipv4_addr; flags dynamic,timeout; timeout 10s; size 65536; }
+
+    # Ограничения для ICMP-пакетов, адресованных самому хосту.
+    chain check_local_icmp {
+        # Защита от перенаправления трафика через посторонний шлюз по ложному ICMP Redirect.
+        icmp type redirect counter drop
+
+        # Защита от раскрытия системного времени удалённому узлу.
+        icmp type timestamp-request counter drop
+
+        # Защита от ping-флуда с одного IP. Пример порога — 5 пакетов/с со всплеском до 10.
+        iifname != "lo" icmp type echo-request \
+            update @echo_rate { ip saddr limit rate over 5/second burst 10 packets } counter drop
+    }
+
+    # Общая проверка состояния пакетов для локального и транзитного трафика.
+    chain check_conntrack {
+        # Защита от пакетов с ошибками протокола или неверным состоянием соединения.
+        ct state invalid counter drop
+    }
+
+    # Проверки входящих IPv4-пакетов до выбора маршрута.
+    chain prerouting_checks {
+        type filter hook prerouting priority raw;
+
+        # Защита от подмены IP источника групповым или ограниченным широковещательным адресом.
+        ip saddr { 224.0.0.0/4, 255.255.255.255 } counter drop
+
+        # Защита от устаревших ICMP-сигналов, в том числе ложного запроса снизить скорость.
+        icmp type { source-quench, 6, 15-18, 30-39 } counter drop
+    }
+
+    # Защита сетевых служб самого хоста.
+    chain input_checks {
+        type filter hook input priority filter;
+
+        # Защита хоста от ложных Redirect, раскрытия времени и ping-флуда.
+        ip protocol icmp jump check_local_icmp
+
+        # Защита очередей полуоткрытых соединений от SYN-флуда с одного IP.
+        # Пример порога — 30 пакетов/с на IP суммарно по всем портам со всплеском до 60.
+        iifname != "lo" tcp flags syn / syn,ack,fin,rst \
+            update @syn_rate { ip saddr limit rate over 30/second burst 60 packets } counter drop
+
+        # Защита локальных служб от пакетов, признанных conntrack некорректными.
+        jump check_conntrack
+    }
+
+    # Проверка состояния соединений, проходящих через маршрутизатор.
+    chain forward_state_checks {
+        type filter hook forward priority filter;
+
+        # Защита узлов за маршрутизатором от пакетов, признанных conntrack некорректными.
+        jump check_conntrack
+    }
+}
+NFT
+    nft --check --file "$scratch/init-security-rules.nft"
+    write_config "$rules" 644 < "$scratch/init-security-rules.nft"
+    write_config "/etc/systemd/system/$unit" 644 <<'UNIT'
+[Unit]
+Description=Initial IPv4 security rules
+DefaultDependencies=no
+After=local-fs.target nftables.service
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft --file /etc/init-security-rules.nft
+
+[Install]
+WantedBy=sysinit.target
+UNIT
+    systemctl daemon-reload
+    systemctl restart "$unit"
+    systemctl enable "$unit"
+}
+
 initialize_host() (
     export PATH=/usr/sbin:/usr/bin:/sbin:/bin
     export LC_ALL=C
@@ -988,6 +1089,7 @@ initialize_host() (
     configure_time_sync
     configure_base_software
     configure_network
+    configure_firewall
     configure_security
     configure_security_updates
     printf 'Initialization complete. SSH port: %s\n' "$ssh_port"
